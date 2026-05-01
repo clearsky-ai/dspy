@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable
 
 import dspy
@@ -52,36 +53,52 @@ class BestOfN(Module):
         self.N = N
         self.fail_count = fail_count or N  # default to N if fail_count is not provided
 
+    def _run_single(self, rid, kwargs):
+        """Run a single attempt with the given rollout id."""
+        lm = self.module.get_lm() or dspy.settings.lm
+        lm_ = lm.copy(rollout_id=rid, temperature=1.0)
+        mod = self.module.deepcopy()
+        mod.set_lm(lm_)
+
+        with dspy.context(trace=[]):
+            pred = mod(**kwargs)
+            trace = dspy.settings.trace.copy()
+            # NOTE: Not including the trace of reward_fn.
+            reward = self.reward_fn(kwargs, pred)
+
+        return pred, trace, reward
+
     def forward(self, **kwargs):
         lm = self.module.get_lm() or dspy.settings.lm
         start = lm.kwargs.get("rollout_id", 0)
         rollout_ids = [start + i for i in range(self.N)]
         best_pred, best_trace, best_reward = None, None, -float("inf")
+        fail_count = 0
 
-        for idx, rid in enumerate(rollout_ids):
-            lm_ = lm.copy(rollout_id=rid, temperature=1.0)
-            mod = self.module.deepcopy()
-            mod.set_lm(lm_)
+        with ThreadPoolExecutor(max_workers=self.N) as executor:
+            future_to_rid = {
+                executor.submit(self._run_single, rid, kwargs): rid
+                for rid in rollout_ids
+            }
 
-            try:
-                with dspy.context(trace=[]):
-                    pred = mod(**kwargs)
-                    trace = dspy.settings.trace.copy()
+            for future in as_completed(future_to_rid):
+                rid = future_to_rid[future]
+                try:
+                    pred, trace, reward = future.result()
 
-                    # NOTE: Not including the trace of reward_fn.
-                    reward = self.reward_fn(kwargs, pred)
+                    if reward > best_reward:
+                        best_reward, best_pred, best_trace = reward, pred, trace
 
-                if reward > best_reward:
-                    best_reward, best_pred, best_trace = reward, pred, trace
+                    # Return immediately if threshold is met
+                    if reward >= self.threshold:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
 
-                if reward >= self.threshold:
-                    break
-
-            except Exception as e:
-                print(f"BestOfN: Attempt {idx + 1} failed with rollout id {rid}: {e}")
-                if idx > self.fail_count:
-                    raise e
-                self.fail_count -= 1
+                except Exception as e:
+                    fail_count += 1
+                    print(f"BestOfN: Attempt with rollout id {rid} failed: {e}")
+                    if fail_count > self.fail_count:
+                        raise e
 
         if best_trace:
             dspy.settings.trace.extend(best_trace)
